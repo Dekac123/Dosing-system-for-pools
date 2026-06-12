@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "../../Arduino Dozer sistem"
+		},
+		{
+			"name": "Dozer",
+			"path": ".."
+		},
+		{
+			"name": "Dosing-system-for-pools",
+			"path": "../../../../GitHub Clone/Dosing-system-for-pools"
+		},
+		{
+			"name": "Dosing-system-for-pools",
+			"path": "../../Dosing-system-for-pools/Dosing-system-for-pools"
+		}
+	],
+	"settings": {}
+}
