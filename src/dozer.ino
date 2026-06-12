@@ -38,19 +38,22 @@ bool optoLastState = HIGH;
 unsigned long optoDebounce = 0;
 
 // TEST VREDNOSTI (promenite za testiranje)
+/*
 const unsigned long DOSE_DELAY_MS = 3 * 1000UL;      // 3 sekunde
 const unsigned long DOSE_RUN_MS = 5 * 1000UL;       // 5 sekundi
 const unsigned long DOSE_PAUSE_MS = 3 * 1000UL;     // 3 sekunde
 
 const unsigned long MAX_PUMP_ON_MS =  0.1 * 60 * 1000UL; // 1 sat
+*/
 
-/* PRAVE VREDNOSTI
-const unsigned long DOSE_DELAY_MS = 2 * 60 * 1000UL;   // 2 minuta
+//PRAVE VREDNOSTI
+const unsigned long DOSE_DELAY_MS = 1 * 60 * 1000UL;   // 1 minut
 const unsigned long DOSE_RUN_MS = 20 * 60 * 1000UL;    // 20 minuta
 const unsigned long DOSE_PAUSE_MS = 10 * 60 * 1000UL;  // 10 minuta
-*/
+
 // Sigurnosni mehanizam (maksimalno neprekidno uključenje pumpe)
-//const unsigned long MAX_PUMP_ON_MS = 60 * 60 * 1000UL; // 1 sat
+const unsigned long MAX_PUMP_ON_MS = 60 * 60 * 1000UL; // 1 sat
+//*/
 
 // ========== DISPLAY ==========
 unsigned long resultStartTime = 0;
@@ -176,7 +179,7 @@ void startDosing() {
   dosingActive = true;
   dosingStep = 0;
   dosingStepStart = millis();
-  showMessage("Priprema...");
+  showMessage("Priprema");
 }
 
 void updateDosing() {
@@ -273,11 +276,11 @@ void drawSplash() {
   display.setTextSize(2.5);
   int16_t x1, y1;
   uint16_t w, h;
-  display.getTextBounds("IOFH :)", 0, 0, &x1, &y1, &w, &h);
+  display.getTextBounds("IOFH", 0, 0, &x1, &y1, &w, &h);
   int x = (SCREEN_WIDTH - w) / 2;
   int y = (SCREEN_HEIGHT - h) / 2;
   display.setCursor(x, y);
-  display.print(F("IOFH :)"));
+  display.print(F("IOFH"));
   display.display();
   delay(3000);
 }
