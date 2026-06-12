@@ -1,0 +1,392 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ========== PINS ==========
+const int BTN_D7 = 7;
+const int BTN_D8 = 8;
+const int BTN_D9 = 9;
+const int OPTO_D6 = 6;
+const int RELAY_D5 = 5;
+const int RELAY_D4 = 4;
+const int SEQ_D2 = 2;
+const int SEQ_D3 = 3;
+const int PH_PIN = A7;
+
+// ========== pH VARIJABLE ==========
+int buffer[20];
+int sampleIndex = 0;
+unsigned long lastSampleTime = 0;
+float pH_value = 0.0;
+bool measuring = false;
+bool done = false;
+
+// ========== SEKVENCA ZA pH (D9) ==========
+enum { SEQ_IDLE, SEQ_STAGE1, SEQ_STAGE2, SEQ_STAGE3 } seqState = SEQ_IDLE;
+unsigned long seqStartTime = 0;
+
+// ========== DOZIRANJE (optokapler) – ORIGINALNE VREDNOSTI ==========
+bool dosingActive = false;
+int dosingStep = 0;
+unsigned long dosingStepStart = 0;
+bool optoLastState = HIGH;
+unsigned long optoDebounce = 0;
+
+// TEST VREDNOSTI (promenite za testiranje)
+const unsigned long DOSE_DELAY_MS = 3 * 1000UL;      // 3 sekunde
+const unsigned long DOSE_RUN_MS = 5 * 1000UL;       // 5 sekundi
+const unsigned long DOSE_PAUSE_MS = 3 * 1000UL;     // 3 sekunde
+
+const unsigned long MAX_PUMP_ON_MS =  0.1 * 60 * 1000UL; // 1 sat
+
+/* PRAVE VREDNOSTI
+const unsigned long DOSE_DELAY_MS = 2 * 60 * 1000UL;   // 2 minuta
+const unsigned long DOSE_RUN_MS = 20 * 60 * 1000UL;    // 20 minuta
+const unsigned long DOSE_PAUSE_MS = 10 * 60 * 1000UL;  // 10 minuta
+*/
+// Sigurnosni mehanizam (maksimalno neprekidno uključenje pumpe)
+//const unsigned long MAX_PUMP_ON_MS = 60 * 60 * 1000UL; // 1 sat
+
+// ========== DISPLAY ==========
+unsigned long resultStartTime = 0;
+bool displayOff = false;
+unsigned long msgEndTime = 0;      // do kada traje trenutna poruka
+String currentMsg = "";            // tekst poruke
+
+// ========== DEBAUNS ==========
+bool lastD9 = HIGH;
+unsigned long lastDebounce = 0;
+
+// ========== POMOĆNE FUNKCIJE ==========
+void setRelay(int pin, bool on) {
+  digitalWrite(pin, on ? LOW : HIGH);
+}
+
+// Prikaz poruke na sredini ekrana na 5 sekundi (samo ako se poruka promenila)
+void showMessage(const char* msg) {
+  if (currentMsg == String(msg) && millis() < msgEndTime) return;
+  currentMsg = String(msg);
+  msgEndTime = millis() + 5000UL;
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  display.clearDisplay();
+  display.setTextSize(2);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(msg, 0, 0, &x1, &y1, &w, &h);
+  int x = (SCREEN_WIDTH - w) / 2;
+  int y = (SCREEN_HEIGHT - h) / 2;
+  display.setCursor(x, y);
+  display.print(msg);
+  display.display();
+  displayOff = false;
+}
+
+// ========== pH FUNKCIJE ==========
+void startMeasurement() {
+  sampleIndex = 0;
+  measuring = true;
+  done = false;
+  lastSampleTime = millis();
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  displayOff = false;
+  drawSampling();
+}
+
+void calculatePH() {
+  for (int i = 0; i < 19; i++) {
+    for (int j = i+1; j < 20; j++) {
+      if (buffer[i] > buffer[j]) {
+        int t = buffer[i];
+        buffer[i] = buffer[j];
+        buffer[j] = t;
+      }
+    }
+  }
+  unsigned long sum = 0;
+  for (int i = 2; i < 18; i++) sum += buffer[i];
+  float volt = (float)sum * 5.0 / 1024.0 / 16.0;
+  float calibration = 21.34 - 0.7;
+  pH_value = -1.0 * (-5.70 * volt + calibration);
+}
+
+void updatePH() {
+  if (!measuring || done) return;
+  unsigned long now = millis();
+  if (now - lastSampleTime >= 500) {
+    lastSampleTime = now;
+    buffer[sampleIndex] = analogRead(PH_PIN);
+    sampleIndex++;
+    if (sampleIndex >= 20) {
+      calculatePH();
+      measuring = false;
+      done = true;
+      resultStartTime = millis();
+      drawResult();
+    } else {
+      drawSampling();
+    }
+  }
+}
+
+// ========== SEKVENCA PRE MERENJA (D9) ==========
+void startSequence() {
+
+  if (measuring) return;
+
+  showMessage("pH merenje");
+
+  startMeasurement();
+}
+
+void updateSequence() {
+  // Nista se ne radi
+}
+
+// ========== DOZIRANJE (optokapler) ==========
+void startDosing() {
+  if (dosingActive) return;
+  if (measuring) return;
+  dosingActive = true;
+  dosingStep = 0;
+  dosingStepStart = millis();
+  showMessage("Priprema");
+}
+
+void updateDosing() {
+  if (!dosingActive) return;
+  
+  unsigned long now = millis();
+  unsigned long stepDuration = 0;
+  
+  switch (dosingStep) {
+    case 0: stepDuration = DOSE_DELAY_MS; break;
+    case 1: stepDuration = DOSE_RUN_MS; break;
+    case 2: stepDuration = DOSE_PAUSE_MS; break;
+    case 3: stepDuration = DOSE_RUN_MS; break;
+    case 4: stepDuration = DOSE_PAUSE_MS; break;
+    case 5: stepDuration = DOSE_RUN_MS; break;
+    case 6:
+      dosingActive = false;
+      msgEndTime = 0;      // obriši poruku nakon završetka
+      return;
+  }
+  
+  if (now - dosingStepStart >= stepDuration) {
+    dosingStep++;
+    dosingStepStart = now;
+    if (dosingStep == 1 || dosingStep == 3 || dosingStep == 5) {
+      showMessage("Doziranje");
+    } else if (dosingStep == 2 || dosingStep == 4) {
+      showMessage("Pauza");
+    }
+  }
+}
+
+// ========== UPRAVLJANJE RELEJIMA (sa sigurnosnim tajmerom) ==========
+void updateRelays() {
+  bool btnD7 = (digitalRead(BTN_D7) == LOW);
+  bool btnD8 = (digitalRead(BTN_D8) == LOW);
+  
+  // 1. Željeno stanje pumpe (bez sigurnosnog mehanizma)
+  bool desiredOn = false;
+  if (dosingActive) {
+    bool pumpFromDosing = false;
+    switch (dosingStep) {
+      case 0: pumpFromDosing = false; break;
+      case 1: pumpFromDosing = true;  break;
+      case 2: pumpFromDosing = false; break;
+      case 3: pumpFromDosing = true;  break;
+      case 4: pumpFromDosing = false; break;
+      case 5: pumpFromDosing = true;  break;
+      default: pumpFromDosing = false; break;
+    }
+    // Dugme D7 override tokom pauze
+    if (btnD7 && (dosingStep == 2 || dosingStep == 4)) {
+      desiredOn = true;
+      showMessage("Doziranje");   // prikaži poruku i za ručno uključenje
+    } else {
+      desiredOn = pumpFromDosing;
+    }
+  } else {
+    desiredOn = btnD7;
+    if (btnD7) showMessage("Doziranje");
+  }
+  
+  // 2. Sigurnosni mehanizam (maksimalno trajanje neprekidnog rada)
+  static unsigned long onStartTime = 0;
+  static bool wasOn = false;
+  static bool safetyBlock = false;
+  
+  if (!desiredOn) {
+    safetyBlock = false;
+  }
+  
+  if (desiredOn && !safetyBlock) {
+    if (!wasOn) {
+      onStartTime = millis();
+      wasOn = true;
+    }
+    if (millis() - onStartTime >= MAX_PUMP_ON_MS) {
+      safetyBlock = true;
+      desiredOn = false;
+    }
+  } else if (!desiredOn) {
+    wasOn = false;
+  }
+  
+  if (safetyBlock) desiredOn = false;
+  
+  setRelay(RELAY_D5, desiredOn);
+  setRelay(RELAY_D4, btnD8);
+}
+
+// ========== ISCRTAVANJE ==========
+void drawSplash() {
+  display.clearDisplay();
+  display.setTextSize(2.5);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds("IOFH", 0, 0, &x1, &y1, &w, &h);
+  int x = (SCREEN_WIDTH - w) / 2;
+  int y = (SCREEN_HEIGHT - h) / 2;
+  display.setCursor(x, y);
+  display.print(F("IOFH"));
+  display.display();
+  delay(3000);
+}
+
+void drawSampling() {
+  display.clearDisplay();
+  display.setTextSize(2.5);
+  display.setCursor(20, 15);
+  display.print(F("Merenje"));
+  display.setTextSize(2);
+  display.setCursor(45, 45);
+  display.print(sampleIndex);
+  display.print(F("/20"));
+  display.display();
+  displayOff = false;
+}
+
+void drawResult() {
+  display.clearDisplay();
+  char buf[8];
+  dtostrf(pH_value, 4, 2, buf);
+  display.setTextSize(2.5);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+  int x = (SCREEN_WIDTH - w) / 2;
+  int y = (SCREEN_HEIGHT - h) / 2;
+  display.setCursor(x, y);
+  display.print(buf);
+  display.display();
+  resultStartTime = millis();
+  displayOff = false;
+}
+
+void updateDisplay() {
+  unsigned long now = millis();
+  
+  // 1. pH merenje – crta se u drawSampling() / drawResult()
+  if (measuring && !done) return;
+  if (done && !measuring) {
+    if (!displayOff && (now - resultStartTime >= 7000)) {
+      display.ssd1306_command(SSD1306_DISPLAYOFF);
+      displayOff = true;
+    }
+    return;
+  }
+  
+  // 2. Poruke o doziranju / sekvenci (traju 5 sekundi)
+  if (msgEndTime > 0 && now < msgEndTime) {
+    if (displayOff) {
+      display.ssd1306_command(SSD1306_DISPLAYON);
+      displayOff = false;
+      display.clearDisplay();
+      display.setTextSize(2);
+      int16_t x1, y1;
+      uint16_t w, h;
+      display.getTextBounds(currentMsg.c_str(), 0, 0, &x1, &y1, &w, &h);
+      int x = (SCREEN_WIDTH - w) / 2;
+      int y = (SCREEN_HEIGHT - h) / 2;
+      display.setCursor(x, y);
+      display.print(currentMsg);
+      display.display();
+    }
+    return;
+  } else {
+    msgEndTime = 0;
+  }
+  
+  // 3. Idle stanje – ekran ugašen
+  if (!displayOff) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    displayOff = true;
+  }
+}
+
+// ========== SETUP ==========
+void setup() {
+  pinMode(BTN_D7, INPUT_PULLUP);
+  pinMode(BTN_D8, INPUT_PULLUP);
+  pinMode(BTN_D9, INPUT_PULLUP);
+  pinMode(OPTO_D6, INPUT_PULLUP);
+  
+  pinMode(RELAY_D5, OUTPUT);
+  pinMode(RELAY_D4, OUTPUT);
+  pinMode(SEQ_D2, OUTPUT);
+  pinMode(SEQ_D3, OUTPUT);
+  
+  digitalWrite(RELAY_D5, HIGH);
+  digitalWrite(RELAY_D4, HIGH);
+  digitalWrite(SEQ_D2, HIGH);
+  digitalWrite(SEQ_D3, HIGH);
+  
+  Wire.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  
+  drawSplash();                  // prikaz "IOFH :)" 3 sekunde
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  displayOff = true;
+  
+  // Ako je optokapler već aktivan pri startu
+  if (digitalRead(OPTO_D6) == LOW) {
+    optoLastState = LOW;
+    startDosing();
+  } else {
+    optoLastState = HIGH;
+  }
+}
+
+// ========== LOOP ==========
+void loop() {
+  updateSequence();
+  updatePH();
+  updateDosing();
+  updateRelays();
+  updateDisplay();
+  
+  // Detekcija opadajuće ivice optokaplera (HIGH -> LOW)
+  bool currentOpto = (digitalRead(OPTO_D6) == LOW);
+  if (currentOpto && !optoLastState && (millis() - optoDebounce > 50)) {
+    optoDebounce = millis();
+    startDosing();
+  }
+  optoLastState = currentOpto;
+  
+  // Dugme D9 za merenje pH
+  bool currentD9 = digitalRead(BTN_D9);
+  if (currentD9 == LOW && lastD9 == HIGH && (millis() - lastDebounce > 50)) {
+    lastDebounce = millis();
+    startSequence();
+  }
+  lastD9 = currentD9;
+}
