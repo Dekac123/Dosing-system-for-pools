@@ -1,0 +1,675 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <avr/wdt.h>
+
+// ===== OPCIJA ZA TESTIRANJE =====
+// Otkomentarišite sledeću liniju za testiranje sa sekundama
+//#define USE_TEST_TIMERS
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ========== PINOVI ==========
+const int BTN_D7   = 7;   // prekidač – glavna pumpa (RELAY_D5, vodonik peroksid)
+const int BTN_D8   = 8;   // prekidač – pH minus pumpa (RELAY_D4)
+const int BTN_D9   = 9;   // trenutno merenje pH (momentarno dugme)
+const int OPTO_D6  = 6;   // optokapler
+const int RELAY_D5 = 5;   // glavna pumpa (vodonik peroksid)
+const int RELAY_D4 = 4;   // pH minus pumpa
+const int PH_PIN   = A7;
+
+// ========== VREMENSKE KONSTANTE ==========
+#ifdef USE_TEST_TIMERS
+  const unsigned long WAIT_AFTER_OPTO_MS         =  2UL * 1000UL;
+  const unsigned long PH_MINUS_RUN_FIRST_MS      =  5UL * 1000UL;
+  const unsigned long PH_MINUS_RUN_SUBSEQUENT_MS =  3UL * 1000UL;
+  const unsigned long PH_MINUS_WAIT_MS           =  2UL * 1000UL;
+  const unsigned long MAIN_RUN_MS                =  5UL * 1000UL;
+  const unsigned long MAIN_PAUSE_MS              =  3UL * 1000UL;
+#else
+  const unsigned long WAIT_AFTER_OPTO_MS         =  1UL * 60UL * 1000UL;
+  const unsigned long PH_MINUS_RUN_FIRST_MS      = 30UL * 60UL * 1000UL;
+  const unsigned long PH_MINUS_RUN_SUBSEQUENT_MS = 10UL * 60UL * 1000UL;
+  const unsigned long PH_MINUS_WAIT_MS           =  3UL * 60UL * 1000UL;
+  const unsigned long MAIN_RUN_MS                = 20UL * 60UL * 1000UL;
+  const unsigned long MAIN_PAUSE_MS              = 10UL * 60UL * 1000UL;
+#endif
+
+const int   MAIN_CYCLES      = 3;
+const float PH_MAX           = 7.7;
+const unsigned long MANUAL_MAX_ON_MS = 30UL * 60UL * 1000UL;
+
+// ========== KALIBRACIJA ==========
+const float PH_SLOPE  = -5.94;
+const float PH_OFFSET = 21.88;
+
+// ========== MERENJE ==========
+#define SAMPLES_STD 15
+int sampleBuf[SAMPLES_STD];
+int sampleIndex = 0;
+unsigned long lastSampleTime = 0;
+float currentRawPH = 0.0;
+float pH_value     = 0.0;
+bool measuring = false;
+bool done      = false;
+
+// ========== STANJA ==========
+enum SystemState {
+  STATE_IDLE,
+  STATE_WAIT_AFTER_OPTO,
+  STATE_INITIAL_MEASURE,
+  STATE_SHOW_PH,
+  STATE_DECIDE_INITIAL,
+  STATE_PH_MINUS_RUN,
+  STATE_PH_MINUS_WAIT,
+  STATE_PH_MINUS_MEASURE,
+  STATE_DECIDE_AFTER_PH_MINUS,
+  STATE_MAIN_RUN,
+  STATE_MAIN_PAUSE,
+  STATE_DONE,
+  STATE_MANUAL_ALERT
+};
+SystemState currentState = STATE_IDLE;
+
+unsigned long stateStartTime = 0;
+int  mainCycleCount      = 0;
+bool firstCorrectionDone = false;
+bool initialDoseOnly     = false;  // true = inicijalna doza, posle idi direktno na MAIN_RUN
+
+// ========== ŽELJENO STANJE PUMPI ==========
+// Automat i ručni blok samo postavljaju ove varijable.
+// applyRelays() ih čita jednom na kraju svakog loop-a i piše na pinove.
+bool autoD5 = false;
+bool autoD4 = false;
+
+// ========== RUČNO ==========
+bool manualPumpD5On = false;
+bool manualPumpD4On = false;
+unsigned long manualStartTime = 0;
+bool manualAlert = false;
+
+// ========== OPTO ==========
+bool optoLastState    = HIGH;
+unsigned long optoDebounce = 0;
+
+// ========== DISPLAY ==========
+bool displayOff = false;
+unsigned long msgEndTime = 0;
+// Koristimo char niz umesto String da se izbegne fragmentacija heap-a
+// tokom dugog rada (24/7)
+char currentMsg[32] = "";
+
+// ========== DISPLAY FUNKCIJE ==========
+
+void renderTwoLineText(const char* msg) {
+  // Pronađi prvi razmak i podeli tekst na dve linije ako je dugačak
+  const char* spacePtr = nullptr;
+  int len = strlen(msg);
+
+  if (len > 10) {
+    spacePtr = strchr(msg, ' ');
+  }
+
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  int16_t x1, y1;
+  uint16_t w1, h1, w2, h2;
+
+  if (spacePtr == nullptr) {
+    // Jedna linija
+    display.getTextBounds(msg, 0, 0, &x1, &y1, &w1, &h1);
+    display.setCursor((SCREEN_WIDTH - w1) / 2, (SCREEN_HEIGHT - h1) / 2);
+    display.print(msg);
+  } else {
+    // Dve linije: pre i posle razmaka
+    char line1[21] = {0};
+    char line2[21] = {0};
+    int splitPos = spacePtr - msg;
+    strncpy(line1, msg, min(splitPos, 20));
+    strncpy(line2, spacePtr + 1, 20);
+
+    display.getTextBounds(line1, 0, 0, &x1, &y1, &w1, &h1);
+    display.getTextBounds(line2, 0, 0, &x1, &y1, &w2, &h2);
+    int yTop = (SCREEN_HEIGHT - h1 - 2 - h2) / 2;
+    display.setCursor((SCREEN_WIDTH - w1) / 2, yTop);
+    display.print(line1);
+    display.setCursor((SCREEN_WIDTH - w2) / 2, yTop + h1 + 2);
+    display.print(line2);
+  }
+}
+
+// Poruka koja nestaje nakon 5 sekundi.
+// Ako je ista poruka već aktivna, ne radi ništa (štiti display od konstantnog
+// pozivanja clearDisplay/display svaki loop-prolaz).
+void showMessage(const char* msg) {
+  if (strncmp(currentMsg, msg, sizeof(currentMsg)) == 0 && millis() < msgEndTime) return;
+  strncpy(currentMsg, msg, sizeof(currentMsg) - 1);
+  currentMsg[sizeof(currentMsg) - 1] = '\0';
+  msgEndTime = millis() + 5000UL;
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  display.clearDisplay();
+  renderTwoLineText(msg);
+  display.display();
+  displayOff = false;
+}
+
+// Poruka koja ostaje na ekranu dok se eksplicitno ne promeni
+void showPersistentMessage(const char* msg) {
+  strncpy(currentMsg, msg, sizeof(currentMsg) - 1);
+  currentMsg[sizeof(currentMsg) - 1] = '\0';
+  msgEndTime = 0;
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  display.clearDisplay();
+  renderTwoLineText(msg);
+  display.display();
+  displayOff = false;
+}
+
+void showNoSignal() {
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(30, 15);
+  display.print(F("Nema"));
+  display.setCursor(20, 45);
+  display.print(F("signala"));
+  display.display();
+  displayOff = false;
+  strncpy(currentMsg, "Nema signala", sizeof(currentMsg) - 1);
+  msgEndTime = millis() + 2000UL;
+}
+
+void showPH(float ph) {
+  char buf[8];
+  dtostrf(ph, 4, 2, buf);
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setTextColor(WHITE);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, (SCREEN_HEIGHT - h) / 2);
+  display.print(buf);
+  display.display();
+  displayOff = false;
+}
+
+void updateDisplay() {
+  if (manualAlert) return;
+
+  // Tokom uzorkovanja – prikaži progress bar
+  if (measuring && !done) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(WHITE);
+    display.setCursor(20, 15);
+    display.print(F("Merenje"));
+    display.setCursor(45, 45);
+    display.print(sampleIndex);
+    display.print(F("/"));
+    display.print(SAMPLES_STD);
+    display.display();
+    displayOff = false;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (msgEndTime > 0 && now < msgEndTime) {
+    if (displayOff) {
+      // Ekran je bio ugašen – obnovi prikaz aktivne poruke
+      display.ssd1306_command(SSD1306_DISPLAYON);
+      display.clearDisplay();
+      renderTwoLineText(currentMsg);
+      display.display();
+      displayOff = false;
+    }
+    return;
+  }
+
+  msgEndTime = 0;
+
+  if (!displayOff) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    displayOff = true;
+  }
+}
+
+// ========== RELAY IZLAZ ==========
+// Jedino mesto koje piše na pinove. Poziva se jednom na kraju svakog loop-a.
+// Prioritet: manualAlert > ručni mod > automat
+void applyRelays() {
+  if (manualAlert) {
+    digitalWrite(RELAY_D5, HIGH);
+    digitalWrite(RELAY_D4, HIGH);
+    return;
+  }
+
+  if (manualPumpD5On || manualPumpD4On) {
+    digitalWrite(RELAY_D5, manualPumpD5On ? LOW : HIGH);
+    digitalWrite(RELAY_D4, manualPumpD4On ? LOW : HIGH);
+    return;
+  }
+
+  // Automat – osiguravamo da obe nikada ne rade istovremeno
+  bool d5 = autoD5 && !autoD4;
+  bool d4 = autoD4 && !autoD5;
+  digitalWrite(RELAY_D5, d5 ? LOW : HIGH);
+  digitalWrite(RELAY_D4, d4 ? LOW : HIGH);
+}
+
+// ========== MERENJE pH ==========
+
+float quickReadPH() {
+  int raw[5];
+  for (int i = 0; i < 5; i++) {
+    raw[i] = analogRead(PH_PIN);
+    delay(50);
+  }
+  // Bubble sort – uzimamo srednja 3 od 5
+  for (int i = 0; i < 4; i++) {
+    for (int j = i + 1; j < 5; j++) {
+      if (raw[i] > raw[j]) { int t = raw[i]; raw[i] = raw[j]; raw[j] = t; }
+    }
+  }
+  float volt = (float)(raw[1] + raw[2] + raw[3]) * 5.0 / 1024.0 / 3.0;
+  return PH_SLOPE * volt + PH_OFFSET;
+}
+
+void startMeasurement() {
+  sampleIndex    = 0;
+  measuring      = true;
+  done           = false;
+  lastSampleTime = millis();
+}
+
+void calculatePH() {
+  // Sortiraj i uzmi sredinu (odbaci 2 sa svakog kraja)
+  for (int i = 0; i < SAMPLES_STD - 1; i++) {
+    for (int j = i + 1; j < SAMPLES_STD; j++) {
+      if (sampleBuf[i] > sampleBuf[j]) {
+        int t = sampleBuf[i]; sampleBuf[i] = sampleBuf[j]; sampleBuf[j] = t;
+      }
+    }
+  }
+  unsigned long sum = 0;
+  for (int i = 2; i < SAMPLES_STD - 2; i++) sum += sampleBuf[i];
+  float volt = (float)sum * 5.0 / 1024.0 / (SAMPLES_STD - 4);
+  currentRawPH = PH_SLOPE * volt + PH_OFFSET;
+}
+
+void updatePH() {
+  if (!measuring || done) return;
+  unsigned long now = millis();
+  if (now - lastSampleTime >= 200) {
+    lastSampleTime = now;
+    sampleBuf[sampleIndex++] = analogRead(PH_PIN);
+    if (sampleIndex >= SAMPLES_STD) {
+      calculatePH();
+      measuring = false;
+      done      = true;
+    }
+  }
+}
+
+// ========== AUTOMAT STANJA ==========
+// Automat SAMO postavlja autoD5 i autoD4 – nikada ne piše na pinove direktno.
+
+void startProcess() {
+  if (currentState != STATE_IDLE) return;
+  if (manualAlert) return;
+  manualPumpD5On  = false;
+  manualPumpD4On  = false;
+  manualStartTime = 0;
+  autoD5 = false;
+  autoD4 = false;
+  firstCorrectionDone = false;
+  initialDoseOnly     = false;
+  mainCycleCount      = 0;
+  currentState        = STATE_WAIT_AFTER_OPTO;
+  stateStartTime      = millis();
+  showMessage("Cekam 1 min");
+}
+
+void updateProcess() {
+  // Sigurnosni tajmer za ručni rad
+  if (manualPumpD5On || manualPumpD4On) {
+    if (millis() - manualStartTime >= MANUAL_MAX_ON_MS) {
+      manualPumpD5On  = false;
+      manualPumpD4On  = false;
+      manualStartTime = 0;
+      autoD5       = false;
+      autoD4       = false;
+      manualAlert  = true;
+      currentState = STATE_MANUAL_ALERT;
+      showPersistentMessage("ISKLJUCI PUMPU");
+      return;
+    }
+  }
+
+  if (manualAlert) return;
+
+  bool optoActive = (digitalRead(OPTO_D6) == LOW);
+
+  // Opto izgubljen tokom procesa – prekid
+  if (!optoActive &&
+      currentState != STATE_IDLE &&
+      currentState != STATE_DONE) {
+    autoD5 = false;
+    autoD4 = false;
+    currentState = STATE_IDLE;
+    showMessage("Prekid");
+    return;
+  }
+
+  unsigned long now = millis();
+
+  switch (currentState) {
+
+    case STATE_IDLE:
+      autoD5 = false;
+      autoD4 = false;
+      // FIX: startProcess se poziva SAMO ako nije aktivan nijedan prekidač.
+      // Oba prekidača istovremeno više ne mogu da pokrenu sekvencu.
+      if (optoActive && !manualPumpD5On && !manualPumpD4On) {
+        startProcess();
+      }
+      break;
+
+    case STATE_WAIT_AFTER_OPTO:
+      autoD5 = false;
+      autoD4 = false;
+      if (now - stateStartTime >= WAIT_AFTER_OPTO_MS) {
+        currentState = STATE_INITIAL_MEASURE;
+        startMeasurement();
+        showMessage("Merenje pH");
+      }
+      break;
+
+    case STATE_INITIAL_MEASURE:
+      autoD5 = false;
+      autoD4 = false;
+      updatePH();
+      if (done) {
+        pH_value       = currentRawPH;
+        showPH(pH_value);
+        currentState   = STATE_SHOW_PH;
+        stateStartTime = now;
+      }
+      break;
+
+    case STATE_SHOW_PH:
+      autoD5 = false;
+      autoD4 = false;
+      if (now - stateStartTime >= 3000UL) {
+        currentState   = STATE_DECIDE_INITIAL;
+        stateStartTime = now;
+      }
+      break;
+
+    case STATE_DECIDE_INITIAL:
+      autoD5 = false;
+      autoD4 = false;
+      if (pH_value > PH_MAX) {
+        // pH visok – doza 30 min, zatim direktno na MAIN_RUN
+        firstCorrectionDone = false;
+        initialDoseOnly     = true;
+        currentState        = STATE_PH_MINUS_RUN;
+        stateStartTime      = now;
+        showMessage("Korekcija 30min");
+      } else {
+        // pH u opsegu – doza 10 min, zatim direktno na MAIN_RUN
+        firstCorrectionDone = true;
+        initialDoseOnly     = true;
+        currentState        = STATE_PH_MINUS_RUN;
+        stateStartTime      = now;
+        showMessage("Inicijalno 10min");
+      }
+      break;
+
+    case STATE_PH_MINUS_RUN:
+      autoD5 = false;
+      autoD4 = true;   // D4 (pH minus pumpa) aktivna tokom cijelog stanja
+      {
+        unsigned long runDuration = firstCorrectionDone
+                                    ? PH_MINUS_RUN_SUBSEQUENT_MS
+                                    : PH_MINUS_RUN_FIRST_MS;
+        if (now - stateStartTime >= runDuration) {
+          autoD4 = false;
+          if (initialDoseOnly) {
+            // Inicijalna doza zavrsena - idi direktno na glavno doziranje
+            initialDoseOnly = false;
+            currentState    = STATE_MAIN_RUN;
+            stateStartTime  = now;
+            mainCycleCount  = 0;
+            showMessage("Doziranje");
+          } else {
+            // Naknadna korekcija - izmeri pH pre nastavka
+            currentState   = STATE_PH_MINUS_WAIT;
+            stateStartTime = now;
+            showMessage("Cekanje");
+          }
+        }
+      }
+      break;
+
+    case STATE_PH_MINUS_WAIT:
+      autoD5 = false;
+      autoD4 = false;
+      if (now - stateStartTime >= PH_MINUS_WAIT_MS) {
+        currentState = STATE_PH_MINUS_MEASURE;
+        startMeasurement();
+        showMessage("Merenje pH");
+      }
+      break;
+
+    case STATE_PH_MINUS_MEASURE:
+      autoD5 = false;
+      autoD4 = false;
+      updatePH();
+      if (done) {
+        pH_value       = currentRawPH;
+        showPH(pH_value);
+        currentState   = STATE_DECIDE_AFTER_PH_MINUS;
+        stateStartTime = now;
+      }
+      break;
+
+    case STATE_DECIDE_AFTER_PH_MINUS:
+      autoD5 = false;
+      autoD4 = false;
+      if (now - stateStartTime < 3000UL) break;  // pauza da se pH vrednost vidi
+      if (pH_value > PH_MAX) {
+        // Još uvek visok – ponovi korekciju
+        firstCorrectionDone = true;
+        currentState        = STATE_PH_MINUS_RUN;
+        stateStartTime      = now;
+        showMessage("Korekcija 10min");
+      } else {
+        // pH u opsegu – pređi na glavno doziranje
+        currentState   = STATE_MAIN_RUN;
+        stateStartTime = now;
+        mainCycleCount = 0;
+        showMessage("Doziranje");
+      }
+      break;
+
+    case STATE_MAIN_RUN:
+      autoD5 = true;   // D5 (glavna pumpa) aktivna tokom cijelog stanja
+      autoD4 = false;
+      if (now - stateStartTime >= MAIN_RUN_MS) {
+        autoD5 = false;
+        mainCycleCount++;
+        if (mainCycleCount >= MAIN_CYCLES) {
+          currentState   = STATE_DONE;
+          stateStartTime = now;
+          showMessage("Gotovo");
+        } else {
+          currentState   = STATE_MAIN_PAUSE;
+          stateStartTime = now;
+          showMessage("Pauza");
+        }
+      }
+      break;
+
+    case STATE_MAIN_PAUSE:
+      autoD5 = false;
+      autoD4 = false;
+      if (now - stateStartTime >= MAIN_PAUSE_MS) {
+        currentState   = STATE_MAIN_RUN;
+        stateStartTime = now;
+        showMessage("Doziranje");
+      }
+      break;
+
+    case STATE_DONE:
+      autoD5 = false;
+      autoD4 = false;
+      if (!optoActive) {
+        currentState = STATE_IDLE;
+        showMessage("Cekam signal");
+      }
+      break;
+
+    case STATE_MANUAL_ALERT:
+      autoD5 = false;
+      autoD4 = false;
+      break;
+  }
+}
+
+// ========== SETUP ==========
+
+void setup() {
+  // Watchdog timer – resetuje Arduino ako se loop zaglavi duže od 8 sekundi.
+  // Štiti sistem tokom 24/7 rada od eventualnog zamrzavanja.
+  wdt_enable(WDTO_8S);
+
+  pinMode(BTN_D7,   INPUT_PULLUP);
+  pinMode(BTN_D8,   INPUT_PULLUP);
+  pinMode(BTN_D9,   INPUT_PULLUP);
+  pinMode(OPTO_D6,  INPUT_PULLUP);
+  pinMode(RELAY_D5, OUTPUT);
+  pinMode(RELAY_D4, OUTPUT);
+
+  // Releje odmah isključi pre svega ostalog
+  digitalWrite(RELAY_D5, HIGH);
+  digitalWrite(RELAY_D4, HIGH);
+
+  Wire.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  // Splash ekran
+  display.setTextSize(2);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds("IOFH", 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, (SCREEN_HEIGHT - h) / 2);
+  display.print(F("IOFH"));
+  display.display();
+
+  wdt_reset();  // reset watchdog tokom delay-a
+  delay(3000);
+  wdt_reset();
+
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  displayOff = true;
+
+  optoLastState = (digitalRead(OPTO_D6) == LOW) ? LOW : HIGH;
+  showMessage("Cekam signal");
+}
+
+// ========== LOOP ==========
+
+void loop() {
+  wdt_reset();  // potvrdi watchdog-u da je sistem živ
+
+  updatePH();
+  updateProcess();
+  updateDisplay();
+
+  // ----- D9 – trenutno merenje pH (momentarno dugme s debounce-om) -----
+  static bool lastD9 = HIGH;
+  static unsigned long lastD9Debounce = 0;
+  bool currentD9 = digitalRead(BTN_D9);
+  if (currentD9 == LOW && lastD9 == HIGH && (millis() - lastD9Debounce > 50)) {
+    lastD9Debounce = millis();
+    float ph = quickReadPH();
+    showPH(ph);
+    msgEndTime = millis() + 7000UL;
+  }
+  lastD9 = currentD9;
+
+  // ----- D7 i D8 – stabilni prekidači, direktno praćenje položaja -----
+  // D7 → RELAY_D5 (glavna pumpa, vodonik peroksid)
+  // D8 → RELAY_D4 (pH minus pumpa)
+  bool switchD7 = (digitalRead(BTN_D7) == LOW);   // glavna pumpa
+  bool switchD8 = (digitalRead(BTN_D8) == LOW);   // pH minus pumpa
+
+  bool optoActive   = (digitalRead(OPTO_D6) == LOW);
+  bool allowedState = (currentState == STATE_IDLE || currentState == STATE_DONE);
+
+  if (manualAlert) {
+    // Alarm se ponistava kada korisnik vrati oba prekidaca u OFF polozaj
+    if (!switchD7 && !switchD8) {
+      manualAlert     = false;
+      currentState    = STATE_IDLE;
+      manualPumpD5On  = false;
+      manualPumpD4On  = false;
+      manualStartTime = 0;
+      showMessage("Cekam signal");
+    }
+  } else {
+    // switchD7 → wantD5 (RELAY_D5, glavna pumpa)
+    // switchD8 → wantD4 (RELAY_D4, pH minus)
+    bool wantD5 = switchD7 && optoActive && allowedState;
+    bool wantD4 = switchD8 && optoActive && allowedState;
+
+    // Oba prekidača istovremeno → nijedna pumpa ne radi
+    if (wantD5 && wantD4) { wantD5 = false; wantD4 = false; }
+
+    manualPumpD5On = wantD5;
+    manualPumpD4On = wantD4;
+
+    // Tajmer za sigurnosno isključivanje
+    if (wantD5 || wantD4) {
+      if (manualStartTime == 0) manualStartTime = millis();
+    } else {
+      manualStartTime = 0;
+    }
+
+    // Poruke – samo na promenu stanja
+    static bool lastWantD5 = false;
+    static bool lastWantD4 = false;
+    if      ( wantD5 && !lastWantD5)                { showMessage("Vodonik peroksid"); }
+    else if ( wantD4 && !lastWantD4)                { showMessage("pH -"); }
+    else if (!wantD5 &&  lastWantD5 && !wantD4)     { showMessage("OFF"); msgEndTime = millis() + 1500UL; }
+    else if (!wantD4 &&  lastWantD4 && !wantD5)     { showMessage("OFF"); msgEndTime = millis() + 1500UL; }
+    else if (!optoActive && (switchD7 || switchD8))  { showNoSignal(); }
+    lastWantD5 = wantD5;
+    lastWantD4 = wantD4;
+  }
+
+  // ----- Optokapler – detekcija ivice (HIGH→LOW pokreće sekvencu) -----
+  bool currentOpto = (digitalRead(OPTO_D6) == LOW);
+  if (currentOpto != optoLastState && (millis() - optoDebounce > 50)) {
+    optoDebounce  = millis();
+    optoLastState = currentOpto;
+    // FIX: dodatna provera da nijedan prekidač nije aktivan pre starta.
+    // Ovo je drugi sloj zaštite od slučajnog pokretanja sekvence.
+    if (currentOpto && currentState == STATE_IDLE && !manualAlert &&
+        !manualPumpD5On && !manualPumpD4On) {
+      startProcess();
+    }
+  }
+
+  // ----- Jedini poziv koji piše na releje – uvek poslednji u loop-u -----
+  applyRelays();
+}
