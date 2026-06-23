@@ -111,8 +111,9 @@ void calculatePH() {
   unsigned long sum = 0;
   for (int i = 2; i < 18; i++) sum += buffer[i];
   float volt = (float)sum * 5.0 / 1024.0 / 16.0;
-  float calibration = 21.34 - 0.7;
-  pH_value = -1.0 * (-5.70 * volt + calibration);
+  //float calibration = 21.34 - 0.7;
+  float calibration = 20.68;
+  pH_value = -5.70 * volt + calibration;
 }
 
 void updatePH() {

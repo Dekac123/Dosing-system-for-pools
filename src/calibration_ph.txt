@@ -1,0 +1,125 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ========== PINS ==========
+const int PH_PIN = A7;  // pH sonda na analognom ulazu A7
+
+// ========== KALIBRACIJA ==========
+// Ove vrednosti menjajte dok ne dobijete tačnu pH vrednost
+float calibration_value = 21.28;  // Vaša postojeća kalibracija
+
+// ========== FILTER ZA STABILNIJE OČITAVANJE ==========
+const int NUM_SAMPLES = 10;  // broj uzoraka za prosečnu vrednost
+int samples[NUM_SAMPLES];
+int sampleIndex = 0;
+unsigned long lastSampleTime = 0;
+const unsigned long SAMPLE_INTERVAL = 200;  // 200ms između uzoraka
+
+// ========== FUNKCIJE ==========
+float readPH() {
+  // Srednja vrednost poslednjih NUM_SAMPLES očitavanja
+  unsigned long sum = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    sum += samples[i];
+  }
+  float avg = (float)sum / NUM_SAMPLES;
+  
+  // Konverzija u pH
+  float volt = avg * 5.0 / 1024.0;
+  float ph = -5.70 * volt + calibration_value;
+  
+  return ph;
+}
+
+void updateSamples() {
+  unsigned long now = millis();
+  if (now - lastSampleTime >= SAMPLE_INTERVAL) {
+    lastSampleTime = now;
+    samples[sampleIndex] = analogRead(PH_PIN);
+    sampleIndex++;
+    if (sampleIndex >= NUM_SAMPLES) {
+      sampleIndex = 0;
+    }
+  }
+}
+
+void drawPH(float ph) {
+  display.clearDisplay();
+  
+  // Prikaz "pH" natpisa
+  display.setTextSize(1.5);
+  display.setCursor(10, 10);
+  display.print(F("pH vrednost:"));
+  
+  // Prikaz pH vrednosti (veliki broj)
+  display.setTextSize(3);
+  display.setCursor(10, 35);
+  
+  char buf[10];
+  dtostrf(ph, 5, 2, buf);  // format: "XX.XX"
+  display.print(buf);
+  
+  // Prikaz sirovog ADC očitanja (za dodatnu informaciju)
+  display.setTextSize(1);
+  display.setCursor(10, 55);
+  display.print(F("ADC: "));
+  display.print(samples[sampleIndex]);
+  
+  display.display();
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(9600);
+  
+  // Inicijalizacija OLED
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    // Ako OLED nije pronađen, šaljemo na Serial
+    Serial.println(F("OLED nije pronađen!"));
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  
+  // Inicijalizacija bafera za filtriranje
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    samples[i] = analogRead(PH_PIN);
+  }
+  lastSampleTime = millis();
+  
+  Serial.println(F("=== pH KALIBRACIJA ==="));
+  Serial.println(F("Podesite trimmer na pH sondi"));
+  Serial.println(F("Dok ne dobijete zeljenu vrednost"));
+  Serial.println(F("Trenutna pH vrednost ce biti"));
+  Serial.println(F("prikazana na OLED ekranu."));
+  Serial.println();
+}
+
+// ========== LOOP ==========
+void loop() {
+  // Ažuriraj uzorke
+  updateSamples();
+  
+  // Pročitaj trenutnu pH vrednost
+  float ph = readPH();
+  
+  // Prikaži na OLED
+  drawPH(ph);
+  
+  // Ispiši na Serial Monitor (za dodatnu kontrolu)
+  static unsigned long lastSerialPrint = 0;
+  if (millis() - lastSerialPrint > 1000) {
+    lastSerialPrint = millis();
+    Serial.print(F("pH: "));
+    Serial.println(ph, 2);
+  }
+  
+  // Mala pauza da ne opterećuje procesor
+  delay(50);
+}
